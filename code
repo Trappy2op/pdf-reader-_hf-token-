@@ -1,0 +1,333 @@
+"""
+pdf_rag_mistral_tkinter.py
+Desktop Tkinter RAG app:
+ - Upload PDF(s)
+ - Chunk & embed using SentenceTransformers (all-MiniLM-L6-v2)
+ - Index using FAISS
+ - Query -> retrieve top-k chunks -> call Mistral via HF Inference API
+"""
+
+import os
+import re
+import json
+import threading
+import traceback
+from pathlib import Path
+from typing import List
+
+import fitz  # PyMuPDF
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
+from huggingface_hub import InferenceClient
+
+from tkinter import *
+from tkinter import filedialog, messagebox, scrolledtext
+from tkinter.ttk import Progressbar, Checkbutton
+
+# ---------------- CONFIG ----------------
+MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
+HF_TOKEN = os.getenv("HF_TOKEN", "")  # MUST set before running
+EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
+
+INDEX_PATH = "faiss_index.bin"
+TEXTS_PATH = "rag_texts.json"
+
+EMBED_MODEL = SentenceTransformer(EMBED_MODEL_NAME)
+
+# Inference client (If HF_TOKEN is empty, we'll disable remote generation)
+client = None
+if HF_TOKEN:
+    try:
+        client = InferenceClient(model=MODEL_NAME, token=HF_TOKEN)
+    except Exception as e:
+        client = None
+
+# PDF heading detection (optional, used if you want to use heading heuristics)
+HEADING_PATTERNS = [
+    r"^(Chapter\s+\d+[:.\-\s].*)$",
+    r"^(Section\s+\d+[:.\-\s].*)$",
+    r"^(\d+\.\s+[A-Za-z].*)$"
+]
+HEADING_RE = re.compile("|".join(HEADING_PATTERNS), flags=re.IGNORECASE | re.MULTILINE)
+
+# Utilities
+
+def extract_pdf_chunks(path: str, min_len: int = 120) -> List[dict]:
+    """
+    Extract paragraphs from each page. Return list of dicts:
+    {"text": "...", "meta": "filename | page X | chunk Y"}
+    """
+    doc = fitz.open(path)
+    chunks = []
+    for page_num, page in enumerate(doc, start=1):
+        try:
+            text = page.get_text("text") or ""
+        except Exception:
+            # fallback
+            text = page.get_text() or ""
+        # split by double newlines or long newlines; keep paragraphs longer than min_len
+        paras = [p.strip() for p in re.split(r"\n{2,}", text) if len(p.strip()) >= min_len]
+        # further join too-short adjacent paras
+        merged = []
+        temp = ""
+        for p in paras:
+            if len(p) < min_len:
+                temp += (" " + p)
+            else:
+                combined = (temp + " " + p).strip() if temp else p
+                merged.append(combined)
+                temp = ""
+        if temp:
+            merged.append(temp.strip())
+        for i, para in enumerate(merged):
+            chunks.append({
+                "text": para,
+                "meta": f"{os.path.basename(path)} | page {page_num} | chunk {i+1}"
+            })
+    doc.close()
+    return chunks
+
+def build_faiss_index(embeddings: np.ndarray):
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatIP(dim)  # use inner product on normalized vectors (cosine)
+    return index
+
+def add_to_index(chunks: List[dict], save: bool = True):
+    """
+    Encode chunks, add to FAISS index, and persist texts+index.
+    """
+    if not chunks:
+        return 0
+    texts = [c["text"] for c in chunks]
+    metas = [c["meta"] for c in chunks]
+
+    # embeddings: normalize after encoding to use inner product as cosine
+    emb = EMBED_MODEL.encode(texts, convert_to_numpy=True, show_progress_bar=False)
+    # normalize
+    norms = np.linalg.norm(emb, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    emb = emb / norms
+
+    # load existing
+    if os.path.exists(INDEX_PATH) and os.path.exists(TEXTS_PATH):
+        index = faiss.read_index(INDEX_PATH)
+        all_data = json.load(open(TEXTS_PATH, "r", encoding="utf-8"))
+    else:
+        index = build_faiss_index(emb)
+        all_data = []
+
+    index.add(emb.astype(np.float32))
+    # extend all_data with dicts
+    for t, m in zip(texts, metas):
+        all_data.append({"text": t, "meta": m})
+    if save:
+        faiss.write_index(index, INDEX_PATH)
+        with open(TEXTS_PATH, "w", encoding="utf-8") as f:
+            json.dump(all_data, f, ensure_ascii=False, indent=2)
+    return len(chunks)
+
+def load_index_and_texts():
+    if os.path.exists(INDEX_PATH) and os.path.exists(TEXTS_PATH):
+        index = faiss.read_index(INDEX_PATH)
+        all_data = json.load(open(TEXTS_PATH, "r", encoding="utf-8"))
+        return index, all_data
+    return None, []
+
+def rag_retrieve(query: str, k: int = 3) -> List[dict]:
+    """
+    Return top-k retrieved items as list of {"text":..., "meta":..., "score":...}
+    """
+    idx, all_data = load_index_and_texts()
+    if not idx or not all_data:
+        return []
+    q_emb = EMBED_MODEL.encode([query], convert_to_numpy=True)
+    q_emb = q_emb / (np.linalg.norm(q_emb, axis=1, keepdims=True) + 1e-12)
+    distances, indices = idx.search(q_emb.astype(np.float32), k)
+    results = []
+    for dist, ind in zip(distances[0], indices[0]):
+        if ind < 0 or ind >= len(all_data):
+            continue
+        item = all_data[ind]
+        results.append({"text": item["text"], "meta": item["meta"], "score": float(dist)})
+    return results
+
+def get_response_from_hf(prompt: str, context: str = "", max_tokens: int = 350) -> str:
+    """
+    Call Hugging Face InferenceClient chat_completion if available.
+    Uses a simple system/user structure to instruct Mistral to cite sources and respect provenance.
+    """
+    if client is None:
+        return "HF Inference client not configured. Set HF_TOKEN environment variable to enable remote generation."
+    role_instruction = (
+        "You are a senior factory safety advisor. Answer in 4 short sections:\n"
+        "1) Immediate safety actions (bulleted)\n"
+        "2) Legal obligations (cite the excerpt)\n"
+        "3) Follow-up & prevention measures\n"
+        "4) Provenance (list source files/pages)\n"
+        "Use the provided context and do not hallucinate. If context lacks info, say so clearly."
+    )
+    context_blob = f"\n\nContext (retrieved excerpts):\n{context}" if context else ""
+    messages = [
+        {"role": "system", "content": role_instruction},
+        {"role": "user", "content": prompt + context_blob}
+    ]
+    try:
+        # Use chat_completion if available; fall back to text_generation otherwise
+        # chat_completion returns choices[...] with .message
+        response = client.chat_completion(messages, max_tokens=max_tokens, temperature=0.2)
+        return response.choices[0].message["content"]
+    except Exception:
+        # fallback to text generation endpoint
+        try:
+            input_text = role_instruction + "\n\n" + prompt + context_blob
+            resp = client.generate(input_text, max_new_tokens=max_tokens, temperature=0.2)
+            # resp is object with generated_text
+            if isinstance(resp, dict) and "generated_text" in resp:
+                return resp["generated_text"]
+            # If HF client returns a more complex object:
+            return str(resp)
+        except Exception as e:
+            return f"Error calling HF Inference: {e}"
+
+# Tkinter UI 
+
+class RAGApp:
+    def __init__(self, root):
+        self.root = root
+        root.title("PDF-RAG — Mistral (HF Inference) + Local FAISS")
+        root.geometry("1000x760")
+
+        Label(root, text="Query:", font=("Arial", 12)).pack(pady=6)
+        self.question_entry = Entry(root, width=120)
+        self.question_entry.pack(pady=4)
+
+        self.chat_display = scrolledtext.ScrolledText(root, width=140, height=30, font=("Courier", 10))
+        self.chat_display.pack(pady=8)
+
+        self.status_var = StringVar(value=f"Model: {MODEL_NAME} | Local FAISS")
+        Label(root, textvariable=self.status_var, fg="darkgreen").pack()
+
+        self.progress = Progressbar(root, mode='indeterminate', length=400)
+
+        self.use_rag_var = IntVar(value=1)
+        Checkbutton(root, text="Use local RAG retrieval", variable=self.use_rag_var).pack()
+
+        frame = Frame(root)
+        frame.pack(pady=6)
+
+        Button(frame, text="Ask (Enter)", command=self.ask, width=18).grid(row=0, column=0, padx=6)
+        Button(frame, text="Load PDF", command=self.load_pdf, width=18).grid(row=0, column=1, padx=6)
+        Button(frame, text="Show Index Info", command=self.show_index_info, width=18).grid(row=0, column=2, padx=6)
+        Button(frame, text="Export Index", command=self.export_index, width=18).grid(row=0, column=3, padx=6)
+
+        self.chat_log = []
+
+        # bind Enter
+        self.question_entry.bind("<Return>", lambda e: self.ask())
+
+    def append_chat(self, speaker: str, text: str):
+        self.chat_display.insert(END, f"{speaker}: {text}\n\n")
+        self.chat_display.yview(END)
+
+    def ask(self):
+        q = self.question_entry.get().strip()
+        if not q:
+            return
+        self.append_chat("You", q)
+        self.question_entry.delete(0, END)
+
+        def task():
+            try:
+                self.status_var.set("Retrieving context...")
+                self.progress.pack(pady=4)
+                self.progress.start()
+                retrieved = rag_retrieve(q, k=4) if self.use_rag_var.get() else []
+                if retrieved:
+                    ctx_texts = []
+                    provenance = []
+                    for r in retrieved:
+                        ctx_texts.append(f"{r['text']}\n(Source: {r['meta']})")
+                        provenance.append(r['meta'])
+                    rag_ctx = "\n\n".join(ctx_texts)
+                    # show retrieved items for transparency
+                    self.append_chat("Retrieved", "\n\n---\n\n".join([f"{r['meta']} (score: {r['score']:.4f})\n{r['text'][:1000]}..." for r in retrieved]))
+                else:
+                    rag_ctx = ""
+                self.status_var.set("Calling Mistral (HF Inference)...")
+                ans = get_response_from_hf(q, rag_ctx)
+                # add provenance suffix
+                if retrieved:
+                    prov_list = list(dict.fromkeys(provenance))  # unique keep order
+                    prov_str = "\n\nProvenance:\n" + "\n".join(prov_list)
+                    ans = ans.strip() + prov_str
+                self.append_chat("Mistral", ans)
+                self.chat_log.append((q, ans))
+                self.status_var.set("Ready.")
+            except Exception as e:
+                self.status_var.set("Error.")
+                self.append_chat("Error", traceback.format_exc())
+            finally:
+                self.progress.stop()
+                self.progress.pack_forget()
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def load_pdf(self):
+        files = filedialog.askopenfilenames(filetypes=[("PDF Files", "*.pdf")])
+        if not files:
+            return
+
+        def task():
+            try:
+                total_chunks = 0
+                self.status_var.set("Extracting PDF(s)...")
+                self.progress.pack(pady=4)
+                self.progress.start()
+                for fpath in files:
+                    new_chunks = extract_pdf_chunks(fpath)
+                    added = add_to_index(new_chunks)
+                    total_chunks += added
+                    self.append_chat("Info", f"Added {added} chunks from {os.path.basename(fpath)}")
+                self.status_var.set(f"Added {total_chunks} chunks. Index updated.")
+                messagebox.showinfo("PDF Load", f"Added {total_chunks} chunks across {len(files)} file(s).")
+            except Exception as e:
+                self.status_var.set("Error loading PDF")
+                messagebox.showerror("Error", str(e))
+            finally:
+                self.progress.stop()
+                self.progress.pack_forget()
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def show_index_info(self):
+        idx, all_data = load_index_and_texts()
+        if not idx or not all_data:
+            messagebox.showinfo("Index Info", "No index found yet.")
+            return
+        msg = f"Index entries: {len(all_data)}\nFirst 5 entries:\n"
+        for i, it in enumerate(all_data[:5], start=1):
+            msg += f"{i}) {it['meta']} — {it['text'][:200]}...\n\n"
+        messagebox.showinfo("Index Info", msg)
+
+    def export_index(self):
+        save_to = filedialog.asksaveasfilename(defaultextension=".zip", filetypes=[("Zip", "*.zip")], initialfile="pdf_rag_export.zip")
+        if not save_to:
+            return
+        # create a zip with index and texts
+        try:
+            import zipfile
+            with zipfile.ZipFile(save_to, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                if os.path.exists(INDEX_PATH):
+                    zf.write(INDEX_PATH, arcname=os.path.basename(INDEX_PATH))
+                if os.path.exists(TEXTS_PATH):
+                    zf.write(TEXTS_PATH, arcname=os.path.basename(TEXTS_PATH))
+            messagebox.showinfo("Exported", f"Exported to {save_to}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+
+if __name__ == "__main__":
+    root = Tk()
+    app = RAGApp(root)
+    root.mainloop()
